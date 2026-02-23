@@ -494,7 +494,7 @@ class DashboardWidget(QWidget):
             
             bar = QProgressBar()
             bar.setMaximum(100)
-            bar.setValue(disk['percent'])
+            bar.setValue(int(disk['percent']))
             bar.setTextVisible(False)
             bar.setFixedHeight(8)
             bar.setStyleSheet(f"""
