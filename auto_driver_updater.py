@@ -102,6 +102,70 @@ class InstalledDriverScanThread(QThread):
         self.drivers_ready.emit(drivers)
 
 
+class AutoUpdateThread(QThread):
+    progress = pyqtSignal(str)
+    complete = pyqtSignal(bool)
+
+    def __init__(self, to_update_list):
+        super().__init__()
+        self.to_update = to_update_list
+
+    def run(self):
+        try:
+            self.progress.emit("[Auto update] Starting online package update pass via winget...")
+            winget_ok = False
+            try:
+                creation_flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+                winget_cmd = [
+                    "winget",
+                    "upgrade",
+                    "--all",
+                    "--include-unknown",
+                    "--accept-source-agreements",
+                    "--accept-package-agreements",
+                ]
+                winget_result = subprocess.run(
+                    winget_cmd,
+                    capture_output=True,
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                    timeout=1800,
+                    creationflags=creation_flags,
+                )
+                winget_ok = winget_result.returncode == 0
+                if winget_ok:
+                    self.progress.emit("[Auto update] winget completed successfully.")
+                else:
+                    stderr = _safe_text(winget_result.stderr)
+                    self.progress.emit(
+                        f"[Auto update] winget finished with code {winget_result.returncode}: {stderr}"
+                    )
+            except FileNotFoundError:
+                self.progress.emit("[Auto update] winget not found. Continuing with vendor source links.")
+            except Exception as exc:
+                self.progress.emit(f"[Auto update] winget error: {exc}")
+
+            opened = 0
+            for item in self.to_update:
+                source = item.get("source")
+                if source:
+                    try:
+                        webbrowser.open(source)
+                        opened += 1
+                        time.sleep(0.25)
+                    except Exception as e:
+                        self.progress.emit(f"[Auto update] Failed to open {source}: {e}")
+
+            self.progress.emit(
+                f"[Auto update] Opened {opened} vendor/source link(s). Install packages from those pages, then click Refresh."
+            )
+            self.complete.emit(True)
+        except Exception as exc:
+            self.progress.emit(f"[Auto update] Fatal error: {exc}")
+            self.complete.emit(False)
+
+
 class OnlineDriverLookupThread(QThread):
     results_ready = pyqtSignal(list)
     progress = pyqtSignal(int)
@@ -180,14 +244,32 @@ class OnlineDriverLookupThread(QThread):
         if not html:
             return "Unknown"
 
-        versions = re.findall(r"\b\d+(?:\.\d+){1,4}\b", html)
-        if not versions:
-            return "Unknown"
+        versions = []
 
-        cleaned = [v for v in versions if len(v) <= 20]
+        version_patterns = [
+            r"(?:version|v(?:ersion)?)[\s:]*([\d.]{3,20})",
+            r"(?:release|latest)[\s:]*([\d.]{3,20})",
+            r"\b\d+(?:\.\d+){2,3}\b",
+        ]
+
+        for pattern in version_patterns:
+            found = re.findall(pattern, html, re.IGNORECASE)
+            if found:
+                if isinstance(found[0], tuple):
+                    versions.extend([f[0] if f else "" for f in found])
+                else:
+                    versions.extend(found)
+
+        cleaned = [
+            v.strip()
+            for v in versions
+            if v and v.strip() and len(v.strip()) <= 20 and re.match(r"^[\d.]+$", v.strip())
+        ]
+
         if not cleaned:
             return "Unknown"
 
+        cleaned = list(set(cleaned))
         cleaned.sort(key=self.version_tuple, reverse=True)
         return cleaned[0]
 
@@ -202,14 +284,17 @@ class OnlineDriverLookupThread(QThread):
         if not installed or installed == "Unknown":
             return "Unknown Local Version"
         if not online or online == "Unknown":
-            return "Manual Review Needed"
+            return "Check Manually"
 
         local_v = self.version_tuple(installed)
         online_v = self.version_tuple(online)
 
         if online_v > local_v:
             return "Update Available"
-        return "Up To Date"
+        elif online_v == local_v:
+            return "Up To Date"
+        else:
+            return "Check Manually"
 
 
 class AutoDriverUpdaterWidget(QWidget):
@@ -413,13 +498,14 @@ class AutoDriverUpdaterWidget(QWidget):
 
         update_count = len([r for r in results if r.get("status") == "Update Available"])
         uptodate_count = len([r for r in results if r.get("status") == "Up To Date"])
-        review_count = len([r for r in results if r.get("status") == "Manual Review Needed"])
+        review_count = len([r for r in results if "Check Manually" in r.get("status", "") or "Manual" in r.get("status", "")])
+        unknown_count = len([r for r in results if "Unknown" in r.get("status", "")])
 
         self.summary_label.setText(
-            f"Status: {uptodate_count} up to date | {update_count} updates | {review_count} manual review"
+            f"Status: {uptodate_count} up to date | {update_count} updates | {review_count} manual check"
         )
         self.log_text.append(
-            f"[Online scan complete] Up-to-date: {uptodate_count}, Updates: {update_count}, Review: {review_count}"
+            f"[Online scan complete] Up-to-date: {uptodate_count}, Updates: {update_count}, Manual check: {review_count}, Unknown: {unknown_count}"
         )
 
     def refresh_updates(self):
@@ -443,7 +529,7 @@ class AutoDriverUpdaterWidget(QWidget):
                 status_item.setForeground(QColor("#f59e0b"))
             elif status == "Up To Date":
                 status_item.setForeground(QColor("#10b981"))
-            elif status == "Manual Review Needed":
+            elif "Check Manually" in status or "Manual" in status:
                 status_item.setForeground(QColor("#38bdf8"))
             else:
                 status_item.setForeground(QColor("#94a3b8"))
@@ -483,62 +569,32 @@ class AutoDriverUpdaterWidget(QWidget):
             (
                 f"Found {len(to_update)} driver(s) with updates.\n\n"
                 "This updater uses manual web source links (not Windows Update).\n"
-                "Continue and open each source page now?"
+                "Continue and open each source page now?\n\n"
+                "(Process will run in background without freezing.)"
             ),
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
         )
         if reply != QMessageBox.StandardButton.Yes:
             return
 
-        self.log_text.append("[Auto update] Starting online package update pass via winget...")
-        winget_ok = False
-        try:
-            creation_flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
-            winget_cmd = [
-                "winget",
-                "upgrade",
-                "--all",
-                "--include-unknown",
-                "--accept-source-agreements",
-                "--accept-package-agreements",
-            ]
-            winget_result = subprocess.run(
-                winget_cmd,
-                capture_output=True,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-                timeout=1800,
-                creationflags=creation_flags,
+        self.btn_auto_update.setEnabled(False)
+        self.log_text.append("[Auto update] Task running in background...")
+
+        self.update_thread = AutoUpdateThread(to_update)
+        self.update_thread.progress.connect(self.on_update_progress)
+        self.update_thread.complete.connect(self.on_update_complete)
+        self.update_thread.start()
+
+    def on_update_progress(self, message):
+        self.log_text.append(message)
+
+    def on_update_complete(self, success):
+        self.btn_auto_update.setEnabled(True)
+        if success:
+            QMessageBox.information(
+                self,
+                "Update Flow Complete",
+                "Auto-update passed. Review opened source links in your browser,\nthen click Refresh to re-check driver status.",
             )
-            winget_ok = winget_result.returncode == 0
-            if winget_ok:
-                self.log_text.append("[Auto update] winget completed successfully.")
-            else:
-                stderr = (winget_result.stderr or "").strip()
-                self.log_text.append(f"[Auto update] winget finished with code {winget_result.returncode}: {stderr}")
-        except FileNotFoundError:
-            self.log_text.append("[Auto update] winget not found. Continuing with vendor source links.")
-        except Exception as exc:
-            self.log_text.append(f"[Auto update] winget execution error: {exc}")
-
-        opened = 0
-        for item in to_update:
-            source = item.get("source")
-            if source:
-                webbrowser.open(source)
-                opened += 1
-                time.sleep(0.2)
-
-        self.log_text.append(
-            f"[Auto update] Opened {opened} vendor/source link(s). Install packages from those pages, then click Refresh."
-        )
-        QMessageBox.information(
-            self,
-            "Update Flow Started",
-            (
-                f"winget auto-update: {'Success' if winget_ok else 'Completed with warnings/partial'}\n"
-                f"Opened {opened} source page(s).\n"
-                "Install the latest driver(s) from those pages, then use Refresh to re-check status."
-            ),
-        )
+        else:
+            QMessageBox.warning(self, "Update Error", "Auto-update encountered errors. Check log for details.")
