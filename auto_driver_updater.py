@@ -177,15 +177,23 @@ class OnlineDriverLookupThread(QThread):
 
     def run(self):
         results = []
-        try:
-            total = max(len(self.drivers), 1)
-            for i, driver in enumerate(self.drivers):
+        total = max(len(self.drivers), 1)
+        for i, driver in enumerate(self.drivers):
+            try:
                 online_info = self.lookup_driver_online(driver)
                 results.append({**driver, **online_info})
-                self.progress.emit(int(((i + 1) / total) * 100))
-                time.sleep(0.25)
-        except Exception as exc:
-            self.error.emit(f"Online lookup error: {exc}")
+            except Exception as exc:
+                results.append(
+                    {
+                        **driver,
+                        "online_version": "Error",
+                        "status": "Lookup Failed",
+                        "source": "",
+                        "last_checked": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                    }
+                )
+            self.progress.emit(int(((i + 1) / total) * 100))
+            time.sleep(0.15)
 
         self.results_ready.emit(results)
 
@@ -205,7 +213,7 @@ class OnlineDriverLookupThread(QThread):
             "last_checked": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         }
 
-    def fetch_search_result(self, query):
+    def fetch_search_result(self, query, timeout=8):
         search_url = f"https://duckduckgo.com/html/?q={quote(query)}"
         req = Request(
             search_url,
@@ -216,7 +224,7 @@ class OnlineDriverLookupThread(QThread):
         )
 
         try:
-            with urlopen(req, timeout=15) as response:
+            with urlopen(req, timeout=timeout) as response:
                 html = response.read().decode("utf-8", errors="ignore")
 
             link_match = re.search(
@@ -227,7 +235,7 @@ class OnlineDriverLookupThread(QThread):
                 raw_href = link_match.group(1)
                 source = self.resolve_duckduckgo_redirect(raw_href)
             return source, html
-        except Exception:
+        except Exception as e:
             return "", ""
 
     def resolve_duckduckgo_redirect(self, href):
@@ -248,23 +256,31 @@ class OnlineDriverLookupThread(QThread):
 
         version_patterns = [
             r"(?:version|v(?:ersion)?)[\s:]*([\d.]{3,20})",
-            r"(?:release|latest)[\s:]*([\d.]{3,20})",
-            r"\b\d+(?:\.\d+){2,3}\b",
+            r"(?:release|latest|download)[\s:]*([\d.]{3,20})",
+            r"v[\d.]{3,15}",
+            r"\b\d{1,2}\.\d{1,2}(?:\.\d{1,2})?(?:\.\d{1,2})?\b",
         ]
 
         for pattern in version_patterns:
-            found = re.findall(pattern, html, re.IGNORECASE)
-            if found:
-                if isinstance(found[0], tuple):
-                    versions.extend([f[0] if f else "" for f in found])
-                else:
-                    versions.extend(found)
+            try:
+                found = re.findall(pattern, html, re.IGNORECASE)
+                if found:
+                    if isinstance(found[0], tuple):
+                        versions.extend([f[0] if f else "" for f in found])
+                    else:
+                        versions.extend(found)
+            except Exception:
+                pass
 
-        cleaned = [
-            v.strip()
-            for v in versions
-            if v and v.strip() and len(v.strip()) <= 20 and re.match(r"^[\d.]+$", v.strip())
-        ]
+        cleaned = []
+        for v in versions:
+            try:
+                v_str = str(v).strip()
+                if v_str and len(v_str) <= 20 and re.match(r"^v?[\d.]+$", v_str):
+                    v_str = v_str.lstrip("v")
+                    cleaned.append(v_str)
+            except Exception:
+                pass
 
         if not cleaned:
             return "Unknown"
@@ -529,6 +545,8 @@ class AutoDriverUpdaterWidget(QWidget):
                 status_item.setForeground(QColor("#f59e0b"))
             elif status == "Up To Date":
                 status_item.setForeground(QColor("#10b981"))
+            elif "Lookup Failed" in status:
+                status_item.setForeground(QColor("#ef4444"))
             elif "Check Manually" in status or "Manual" in status:
                 status_item.setForeground(QColor("#38bdf8"))
             else:
