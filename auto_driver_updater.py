@@ -22,6 +22,16 @@ from urllib.parse import quote, urlparse, parse_qs, unquote
 from urllib.request import Request, urlopen
 
 
+def _safe_text(value, default=""):
+    if value is None:
+        return default
+    try:
+        text = str(value).strip()
+    except Exception:
+        return default
+    return text if text else default
+
+
 class InstalledDriverScanThread(QThread):
     drivers_ready = pyqtSignal(list)
     progress = pyqtSignal(int)
@@ -47,33 +57,41 @@ class InstalledDriverScanThread(QThread):
                 ],
                 capture_output=True,
                 text=True,
+                encoding="utf-8",
+                errors="replace",
                 timeout=120,
                 creationflags=creation_flags,
             )
 
-            if result.returncode != 0 or not result.stdout.strip():
-                message = result.stderr.strip() or "Driver scan returned no data."
+            stdout_text = _safe_text(result.stdout)
+            stderr_text = _safe_text(result.stderr)
+
+            if result.returncode != 0 or not stdout_text:
+                message = stderr_text or "Driver scan returned no data."
                 self.error.emit(message)
                 self.drivers_ready.emit([])
                 return
 
-            data = json.loads(result.stdout)
+            data = json.loads(stdout_text)
             if not isinstance(data, list):
                 data = [data]
 
             total = max(len(data), 1)
             for i, item in enumerate(data):
                 self.progress.emit(int((i / total) * 100))
-                name = (item.get("DeviceName") or "").strip()
+                if not isinstance(item, dict):
+                    continue
+
+                name = _safe_text(item.get("DeviceName"))
                 if not name:
                     continue
                 drivers.append(
                     {
                         "name": name,
-                        "version": (item.get("DriverVersion") or "Unknown").strip(),
-                        "manufacturer": (item.get("Manufacturer") or "Unknown").strip(),
-                        "provider": (item.get("DriverProviderName") or "Unknown").strip(),
-                        "device_id": item.get("DeviceID") or "",
+                        "version": _safe_text(item.get("DriverVersion"), "Unknown"),
+                        "manufacturer": _safe_text(item.get("Manufacturer"), "Unknown"),
+                        "provider": _safe_text(item.get("DriverProviderName"), "Unknown"),
+                        "device_id": _safe_text(item.get("DeviceID")),
                     }
                 )
 
@@ -488,6 +506,8 @@ class AutoDriverUpdaterWidget(QWidget):
                 winget_cmd,
                 capture_output=True,
                 text=True,
+                encoding="utf-8",
+                errors="replace",
                 timeout=1800,
                 creationflags=creation_flags,
             )
