@@ -19,6 +19,7 @@ from conflict_resolver import ConflictResolverWidget
 from power_management import PowerManagementWidget
 from event_analyzer import EventAnalyzerWidget
 from bsod_analyzer import BSODAnalyzerWidget
+from auto_driver_updater import AutoDriverUpdaterWidget
 
 # Check admin privileges
 def is_admin():
@@ -61,6 +62,7 @@ class MainWindow(QMainWindow):
         self.power_mgmt = PowerManagementWidget()
         self.event_analyzer = EventAnalyzerWidget()
         self.bsod_analyzer = BSODAnalyzerWidget()
+        self.auto_driver_updater = AutoDriverUpdaterWidget()
         
         # Add to stack
         self.content_stack.addWidget(self.dashboard)      # 0
@@ -72,6 +74,7 @@ class MainWindow(QMainWindow):
         self.content_stack.addWidget(self.power_mgmt)     # 6
         self.content_stack.addWidget(self.event_analyzer) # 7
         self.content_stack.addWidget(self.bsod_analyzer)  # 8
+        self.content_stack.addWidget(self.auto_driver_updater)  # 9
         
         main_layout.addWidget(self.content_stack, stretch=1)
         
@@ -109,6 +112,7 @@ class MainWindow(QMainWindow):
             ("🔋 Power Management", 6),
             ("📊 Event Analyzer", 7),
             ("💥 BSOD Analyzer", 8),
+            ("🚀 Auto Driver Updater", 9),
         ]
         
         self.nav_buttons = []
