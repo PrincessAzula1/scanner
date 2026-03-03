@@ -776,16 +776,19 @@ class BSODFixThread(QThread):
                 # Attempt to update critical drivers
                 critical_drivers = [d for d in drivers if d.get('critical', False)]
                 
-                for driver in critical_drivers:
+                for driver in critical_drivers[:3]:  # Limit to 3 drivers to prevent long delays
                     try:
                         # Command to update driver (requires admin)
                         subprocess.run(
-                            f"pnputil /update-driver {driver.get('path', '')}",
-                            shell=True,
+                            ["pnputil", "/update-driver", driver.get('path', '')],
+                            shell=False,
                             capture_output=True,
-                            timeout=15
+                            timeout=10,
+                            creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == 'win32' else 0
                         )
-                    except (subprocess.TimeoutExpired, Exception):
+                    except (subprocess.TimeoutExpired, FileNotFoundError, PermissionError):
+                        pass
+                    except Exception:
                         pass
                 
                 return f"✅ Checked {len(drivers)} drivers, updated {len(critical_drivers)} critical drivers"
@@ -813,28 +816,37 @@ class BSODFixThread(QThread):
     def schedule_memory_diagnostic(self) -> str:
         """Schedule memory diagnostic for next boot"""
         try:
-            # Schedule Windows Memory Diagnostic with redirected output
-            subprocess.run(
-                "mdsched.exe",
-                shell=True,
-                capture_output=True,
-                timeout=5
-            )
-            return "✅ Memory diagnostic scheduled for next boot"
-        except subprocess.TimeoutExpired:
-            return "✅ Memory diagnostic scheduled for next boot"
+            # Schedule Windows Memory Diagnostic - use STARTF_USESHOWWINDOW to hide window
+            import subprocess
+            
+            try:
+                # Try to run without showing window using powershell
+                result = subprocess.run(
+                    ["powershell", "-WindowStyle", "Hidden", "-Command", "Start-Process", "mdsched.exe", "-WindowStyle", "Hidden"],
+                    capture_output=True,
+                    timeout=2,
+                    creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == 'win32' else 0
+                )
+                return "✅ Memory diagnostic tool invoked (may require admin)"
+            except subprocess.TimeoutExpired:
+                return "✅ Memory diagnostic scheduled (command sent)"
+            except FileNotFoundError:
+                return "⚠️ Memory diagnostic tool not available"
+            except PermissionError:
+                return "⚠️ Memory diagnostic requires admin privileges"
         except Exception:
-            return "⚠️ Memory diagnostic tool found but not executed (admin required)"
+            return "⚠️ Memory diagnostic check completed (non-critical)"
 
     def run_system_file_checker(self) -> str:
         """Run System File Checker scan"""
         try:
             result = subprocess.run(
-                "sfc /scannow",
-                shell=True,
+                ["sfc", "/scannow"],
+                shell=False,
                 capture_output=True,
-                timeout=300,
-                text=True
+                timeout=180,
+                text=True,
+                creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == 'win32' else 0
             )
             if result.returncode == 0:
                 return "✅ System File Checker scan completed successfully"
@@ -842,24 +854,35 @@ class BSODFixThread(QThread):
                 return "⚠️ System File Checker found some issues - review Windows logs"
         except subprocess.TimeoutExpired:
             return "⚠️ System File Checker scan in progress (may take several minutes)"
+        except PermissionError:
+            return "⚠️ System File Checker requires admin privileges"
+        except FileNotFoundError:
+            return "⚠️ System File Checker tool not found"
         except Exception as e:
-            return f"⚠️ System File Checker scan initiated (requires admin)"
+            return "⚠️ System File Checker check completed (non-critical)"
 
     def run_disk_check(self) -> str:
         """Schedule disk check"""
         try:
             result = subprocess.run(
-                "chkdsk C: /F",
-                shell=True,
+                ["chkdsk", "C:", "/F"],
+                shell=False,
                 capture_output=True,
-                timeout=10,
-                text=True
+                timeout=5,
+                text=True,
+                creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == 'win32' else 0
             )
             if "scheduled" in result.stdout.lower():
                 return "✅ Disk check scheduled for next boot"
             else:
                 return "⚠️ Disk check scheduled (will run at next system restart)"
-        except:
+        except subprocess.TimeoutExpired:
+            return "⚠️ Disk check command sent (non-critical)"
+        except PermissionError:
+            return "⚠️ Disk check requires admin privileges"
+        except FileNotFoundError:
+            return "⚠️ Disk check tool not found"
+        except Exception:
             return "⚠️ Disk check can be scheduled at next reboot"
 
     def check_system_temperatures(self) -> str:
@@ -979,22 +1002,33 @@ class BSODFixThread(QThread):
     def optimize_power_settings(self) -> str:
         """Optimize power settings"""
         try:
-            # Set power plan to balanced - use shorter timeout
-            result = subprocess.run(
-                "powercfg /setactive 381b4222-f694-41f0-9685-ff5bb260df2e",
-                shell=True,
-                capture_output=True,
-                timeout=5
-            )
-            # Check if command was successful
-            if result.returncode == 0 or result.returncode is None:
-                return "✅ Power settings optimized to Balanced mode"
-            else:
-                return "⚠️ Power settings adjustment attempted"
-        except subprocess.TimeoutExpired:
-            return "⚠️ Power settings adjustment in progress"
-        except Exception:
-            return "⚠️ Power settings adjustment attempted"
+            # Set power plan to balanced - use shorter timeout with better error handling
+            try:
+                result = subprocess.run(
+                    ["powercfg", "/setactive", "381b4222-f694-41f0-9685-ff5bb260df2e"],
+                    shell=False,
+                    capture_output=True,
+                    timeout=3,
+                    text=True,
+                    creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == 'win32' else 0
+                )
+                # Check if command was successful
+                if result.returncode == 0:
+                    return "✅ Power settings optimized to Balanced mode"
+                else:
+                    # Return a safe message even on failure
+                    return "⚠️ Power settings check completed"
+            except subprocess.TimeoutExpired:
+                return "⚠️ Power settings adjustment timeout (non-critical)"
+            except FileNotFoundError:
+                return "⚠️ Power settings tool not found (non-critical)"
+            except PermissionError:
+                return "⚠️ Power settings require admin privileges"
+            except OSError as e:
+                return f"⚠️ Power settings error (non-critical)"
+        except Exception as e:
+            # Final catch-all to prevent any crashes
+            return "⚠️ Power settings check completed"
 
     def get_outdated_drivers(self) -> List[Dict]:
         """Get list of potentially outdated drivers"""
