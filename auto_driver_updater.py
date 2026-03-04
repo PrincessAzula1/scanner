@@ -170,6 +170,9 @@ class OnlineDriverLookupThread(QThread):
     results_ready = pyqtSignal(list)
     progress = pyqtSignal(int)
     error = pyqtSignal(str)
+    MAX_TOTAL_LOOKUP_SECONDS = 300
+    PER_REQUEST_TIMEOUT_SECONDS = 6
+    MAX_SOURCE_PAGES_PER_DRIVER = 2
 
     def __init__(self, drivers):
         super().__init__()
@@ -178,9 +181,29 @@ class OnlineDriverLookupThread(QThread):
     def run(self):
         results = []
         total = max(len(self.drivers), 1)
+        started = time.monotonic()
+        deadline = started + self.MAX_TOTAL_LOOKUP_SECONDS
+
         for i, driver in enumerate(self.drivers):
+            if time.monotonic() >= deadline:
+                remaining = self.drivers[i:]
+                for pending_driver in remaining:
+                    results.append(
+                        {
+                            **pending_driver,
+                            "online_version": "Unknown",
+                            "status": "Skipped (Time Limit Reached)",
+                            "source": "",
+                            "last_checked": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                        }
+                    )
+                self.error.emit(
+                    "Online search reached the 5-minute limit. Remaining drivers were skipped."
+                )
+                self.progress.emit(100)
+                break
             try:
-                online_info = self.lookup_driver_online(driver)
+                online_info = self.lookup_driver_online(driver, deadline=deadline)
                 results.append({**driver, **online_info})
             except Exception as exc:
                 results.append(
@@ -193,18 +216,39 @@ class OnlineDriverLookupThread(QThread):
                     }
                 )
             self.progress.emit(int(((i + 1) / total) * 100))
-            time.sleep(0.15)
+            time.sleep(0.05)
 
         self.results_ready.emit(results)
 
-    def lookup_driver_online(self, driver):
+    def lookup_driver_online(self, driver, deadline=None):
         query = f"{driver['manufacturer']} {driver['name']} driver latest version download"
-        source_url, html = self.fetch_search_result(query)
+        source_url = ""
+        best_html = ""
+        candidate_urls, search_html = self.fetch_search_results(query, deadline=deadline)
 
-        online_version = self.extract_best_version(html)
+        online_version = self.extract_best_version(search_html)
+        if search_html:
+            best_html = search_html
+
+        for candidate in candidate_urls[: self.MAX_SOURCE_PAGES_PER_DRIVER]:
+            if not self.has_time_remaining(deadline):
+                break
+            page_html = self.fetch_url(candidate, deadline=deadline)
+            page_version = self.extract_best_version(page_html)
+            if page_version != "Unknown":
+                online_version = page_version
+                source_url = candidate
+                best_html = page_html
+                break
+            if not source_url:
+                source_url = candidate
+
+        if not source_url and candidate_urls:
+            source_url = candidate_urls[0]
+
         installed_version = driver.get("version", "Unknown")
 
-        status = self.compare_versions(installed_version, online_version)
+        status = self.compare_versions(installed_version, online_version, has_source=bool(source_url))
 
         return {
             "online_version": online_version,
@@ -213,10 +257,41 @@ class OnlineDriverLookupThread(QThread):
             "last_checked": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         }
 
-    def fetch_search_result(self, query, timeout=8):
-        search_url = f"https://duckduckgo.com/html/?q={quote(query)}"
+    def fetch_search_results(self, query, deadline=None):
+        search_urls = [
+            f"https://duckduckgo.com/html/?q={quote(query)}",
+            f"https://lite.duckduckgo.com/lite/?q={quote(query)}",
+            f"https://www.bing.com/search?q={quote(query)}",
+        ]
+
+        merged_links = []
+        search_html = ""
+
+        for search_url in search_urls:
+            html = self.fetch_url(search_url, deadline=deadline)
+            if not html:
+                continue
+            if not search_html:
+                search_html = html
+            for link in self.extract_search_links(search_url, html):
+                if link and link not in merged_links:
+                    merged_links.append(link)
+            if merged_links:
+                break
+
+        return merged_links, search_html
+
+    def fetch_url(self, url, timeout=None, deadline=None):
+        if not self.has_time_remaining(deadline):
+            return ""
+
+        remaining = self.remaining_time(deadline)
+        request_timeout = timeout or self.PER_REQUEST_TIMEOUT_SECONDS
+        if remaining is not None:
+            request_timeout = max(1, min(request_timeout, int(remaining)))
+
         req = Request(
-            search_url,
+            url,
             headers={
                 "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
                 "(KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36"
@@ -224,19 +299,34 @@ class OnlineDriverLookupThread(QThread):
         )
 
         try:
-            with urlopen(req, timeout=timeout) as response:
-                html = response.read().decode("utf-8", errors="ignore")
+            with urlopen(req, timeout=request_timeout) as response:
+                return response.read().decode("utf-8", errors="ignore")
+        except Exception:
+            return ""
 
-            link_match = re.search(
+    def extract_search_links(self, source_url, html):
+        if not html:
+            return []
+
+        links = []
+        source_lower = source_url.lower()
+
+        if "duckduckgo" in source_lower:
+            ddg_matches = re.findall(
                 r'<a[^>]+class="result__a"[^>]+href="([^"]+)"', html, re.IGNORECASE
             )
-            source = ""
-            if link_match:
-                raw_href = link_match.group(1)
-                source = self.resolve_duckduckgo_redirect(raw_href)
-            return source, html
-        except Exception as e:
-            return "", ""
+            if not ddg_matches:
+                ddg_matches = re.findall(r'<a[^>]+href="([^"]+)"[^>]*>[^<]+</a>', html, re.IGNORECASE)
+            for href in ddg_matches:
+                resolved = self.resolve_duckduckgo_redirect(href)
+                if resolved:
+                    links.append(resolved)
+
+        if "bing.com" in source_lower:
+            bing_matches = re.findall(r'<li class="b_algo".*?<a href="([^"]+)"', html, re.IGNORECASE | re.DOTALL)
+            links.extend([href for href in bing_matches if href.startswith("http")])
+
+        return links
 
     def resolve_duckduckgo_redirect(self, href):
         if "uddg=" in href:
@@ -247,6 +337,16 @@ class OnlineDriverLookupThread(QThread):
         if href.startswith("http"):
             return href
         return ""
+
+    def remaining_time(self, deadline):
+        if deadline is None:
+            return None
+        return max(0, deadline - time.monotonic())
+
+    def has_time_remaining(self, deadline):
+        if deadline is None:
+            return True
+        return self.remaining_time(deadline) > 0
 
     def extract_best_version(self, html):
         if not html:
@@ -296,11 +396,11 @@ class OnlineDriverLookupThread(QThread):
         except Exception:
             return (0,)
 
-    def compare_versions(self, installed, online):
+    def compare_versions(self, installed, online, has_source=False):
         if not installed or installed == "Unknown":
             return "Unknown Local Version"
         if not online or online == "Unknown":
-            return "Check Manually"
+            return "Lookup Failed" if not has_source else "Source Found (Version Unknown)"
 
         local_v = self.version_tuple(installed)
         online_v = self.version_tuple(online)
