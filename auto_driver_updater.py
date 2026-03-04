@@ -104,6 +104,7 @@ class InstalledDriverScanThread(QThread):
 
 class AutoUpdateThread(QThread):
     progress = pyqtSignal(str)
+    progress_value = pyqtSignal(int)
     complete = pyqtSignal(bool)
 
     def __init__(self, to_update_list):
@@ -112,40 +113,11 @@ class AutoUpdateThread(QThread):
 
     def run(self):
         try:
+            self.progress_value.emit(0)
             self.progress.emit("[Auto update] Starting online package update pass via winget...")
-            winget_ok = False
-            try:
-                creation_flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
-                winget_cmd = [
-                    "winget",
-                    "upgrade",
-                    "--all",
-                    "--include-unknown",
-                    "--accept-source-agreements",
-                    "--accept-package-agreements",
-                ]
-                winget_result = subprocess.run(
-                    winget_cmd,
-                    capture_output=True,
-                    text=True,
-                    encoding="utf-8",
-                    errors="replace",
-                    timeout=1800,
-                    creationflags=creation_flags,
-                )
-                winget_ok = winget_result.returncode == 0
-                if winget_ok:
-                    self.progress.emit("[Auto update] winget completed successfully.")
-                else:
-                    stderr = _safe_text(winget_result.stderr)
-                    self.progress.emit(
-                        f"[Auto update] winget finished with code {winget_result.returncode}: {stderr}"
-                    )
-            except FileNotFoundError:
-                self.progress.emit("[Auto update] winget not found. Continuing with vendor source links.")
-            except Exception as exc:
-                self.progress.emit(f"[Auto update] winget error: {exc}")
+            self.run_winget_with_progress()
 
+            total_links = len([item for item in self.to_update if item.get("source")])
             opened = 0
             for item in self.to_update:
                 source = item.get("source")
@@ -153,6 +125,9 @@ class AutoUpdateThread(QThread):
                     try:
                         webbrowser.open(source)
                         opened += 1
+                        if total_links > 0:
+                            percent = 85 + int((opened / total_links) * 14)
+                            self.progress_value.emit(min(percent, 99))
                         time.sleep(0.25)
                     except Exception as e:
                         self.progress.emit(f"[Auto update] Failed to open {source}: {e}")
@@ -160,10 +135,68 @@ class AutoUpdateThread(QThread):
             self.progress.emit(
                 f"[Auto update] Opened {opened} vendor/source link(s). Install packages from those pages, then click Refresh."
             )
+            self.progress_value.emit(100)
             self.complete.emit(True)
         except Exception as exc:
             self.progress.emit(f"[Auto update] Fatal error: {exc}")
+            self.progress_value.emit(100)
             self.complete.emit(False)
+
+    def run_winget_with_progress(self):
+        try:
+            creation_flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+            winget_cmd = [
+                "winget",
+                "upgrade",
+                "--all",
+                "--include-unknown",
+                "--accept-source-agreements",
+                "--accept-package-agreements",
+            ]
+
+            winget_process = subprocess.Popen(
+                winget_cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                creationflags=creation_flags,
+            )
+
+            max_seconds = 1800
+            started = time.monotonic()
+            last_percent = -1
+
+            while winget_process.poll() is None:
+                elapsed = time.monotonic() - started
+                if elapsed > max_seconds:
+                    winget_process.kill()
+                    raise TimeoutError("winget timed out")
+
+                simulated_percent = min(80, 5 + int(elapsed * 1.5))
+                if simulated_percent != last_percent:
+                    self.progress_value.emit(simulated_percent)
+                    last_percent = simulated_percent
+
+                time.sleep(1)
+
+            stdout_text, stderr_text = winget_process.communicate()
+            if winget_process.returncode == 0:
+                self.progress_value.emit(85)
+                self.progress.emit("[Auto update] winget completed successfully.")
+            else:
+                stderr = _safe_text(stderr_text)
+                self.progress_value.emit(85)
+                self.progress.emit(
+                    f"[Auto update] winget finished with code {winget_process.returncode}: {stderr}"
+                )
+        except FileNotFoundError:
+            self.progress_value.emit(85)
+            self.progress.emit("[Auto update] winget not found. Continuing with vendor source links.")
+        except Exception as exc:
+            self.progress_value.emit(85)
+            self.progress.emit(f"[Auto update] winget error: {exc}")
 
 
 class OnlineDriverLookupThread(QThread):
@@ -696,18 +729,36 @@ class AutoDriverUpdaterWidget(QWidget):
             return
 
         self.btn_auto_update.setEnabled(False)
+        self.progress.setVisible(True)
+        self.progress.setRange(0, 100)
+        self.progress.setValue(0)
+        self.summary_label.setText("Status: Auto update running (0%)...")
         self.log_text.append("[Auto update] Task running in background...")
 
         self.update_thread = AutoUpdateThread(to_update)
         self.update_thread.progress.connect(self.on_update_progress)
+        self.update_thread.progress_value.connect(self.on_update_percent)
         self.update_thread.complete.connect(self.on_update_complete)
         self.update_thread.start()
 
     def on_update_progress(self, message):
         self.log_text.append(message)
 
+    def on_update_percent(self, percent):
+        self.progress.setVisible(True)
+        self.progress.setRange(0, 100)
+        self.progress.setValue(max(0, min(100, int(percent))))
+        self.summary_label.setText(f"Status: Auto update running ({int(percent)}%)...")
+
     def on_update_complete(self, success):
         self.btn_auto_update.setEnabled(True)
+        self.progress.setVisible(True)
+        self.progress.setRange(0, 100)
+        self.progress.setValue(100)
+        if success:
+            self.summary_label.setText("Status: Auto update complete (100%)")
+        else:
+            self.summary_label.setText("Status: Auto update ended with errors (100%)")
         if success:
             QMessageBox.information(
                 self,
